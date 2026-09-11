@@ -308,9 +308,12 @@ messenger.runtime.onConnect.addListener((port) => {
           const settings = await getSettings();
           const sourceLang = tabId != null ? (detectedLangByTab.get(tabId) || null) : null;
           const { translated, detectedLang } = await translateText(message.text, settings, null, sourceLang, message.structured);
-          // Cache detected lang from translation response (Google / LT)
-          if (tabId != null && detectedLang && !detectedLangByTab.has(tabId)) {
-            detectedLangByTab.set(tabId, detectedLang);
+          // Cache detected lang from translation response (Google / LT). Google
+          // answers "zh-CN", which would never equal the "zh" target it is
+          // compared against, so it has to be narrowed to the base code first.
+          const cached = normalizeLangCode(detectedLang);
+          if (tabId != null && cached && !detectedLangByTab.has(tabId)) {
+            detectedLangByTab.set(tabId, cached);
           }
           port.postMessage({ id: message.id, success: true, translated });
         } catch (e) {
@@ -363,14 +366,10 @@ messenger.runtime.onConnect.addListener((port) => {
           // Preflight normally fills the cache already; this covers a preflight failure.
           if (!detectedLang && tabId != null) {
             try {
-              const msg = await messenger.messageDisplay.getDisplayedMessage(tabId);
-              if (msg) {
-                const full = await messenger.messages.getFull(msg.id);
-                const sample = extractPlainTextFromParts(full).trim().slice(0, 500);
-                if (sample) {
-                  detectedLang = await detectLanguage(sample, settings);
-                  if (detectedLang) detectedLangByTab.set(tabId, detectedLang);
-                }
+              const sample = await getMessageSample(tabId);
+              if (sample) {
+                detectedLang = await detectLanguage(sample, settings);
+                if (detectedLang) detectedLangByTab.set(tabId, detectedLang);
               }
             } catch (e) {
               console.warn("[Translator] language detection failed in checkExemption:", e.message);
@@ -761,8 +760,8 @@ async function detectWithOpenAI(sample, settings) {
 }
 
 // Auto-translate preflight: answers "does this message need translating at all"
-// before any body text is sent anywhere. Runs for every service, because
-// detection is local (see detectLanguageLocally).
+// before any body text is sent anywhere. Runs for every service, because the
+// first two detection stages are local (see detectLanguage).
 async function shouldAutoTranslate(tabId) {
   const settings = await getSettings();
   if (tabId == null) return { skip: false };
@@ -771,13 +770,19 @@ async function shouldAutoTranslate(tabId) {
   let detectedLang = detectedLangByTab.get(tabId) || null;
 
   if (!detectedLang) {
-    const msg = await messenger.messageDisplay.getDisplayedMessage(tabId);
-    if (!msg) return { skip: false };
-    const full = await messenger.messages.getFull(msg.id);
-    const sample = extractPlainTextFromParts(full).trim().slice(0, 500);
-    if (!sample) return { skip: false };
+    const sample = await getMessageSample(tabId);
+    // Both failures end in a full translation, which is the safe default but also
+    // the thing a user reports as "it translated my own language again". Without
+    // these two lines there is nothing in the console to tell the two apart.
+    if (!sample) {
+      console.log("[Translator] no body sample for detection; translating");
+      return { skip: false };
+    }
     detectedLang = await detectLanguage(sample, settings);
-    if (!detectedLang) return { skip: false };
+    if (!detectedLang) {
+      console.log(`[Translator] language undetermined from ${sample.length} chars; translating: "${sample.slice(0, 60)}"`);
+      return { skip: false };
+    }
     // Also spares menus.onShown its own on-demand detection later.
     detectedLangByTab.set(tabId, detectedLang);
   }
@@ -791,9 +796,90 @@ async function shouldAutoTranslate(tabId) {
   return { skip: false, detectedLang };
 }
 
-// Gecko ships CLD2 and exposes it as i18n.detectLanguage. It is local, instant,
-// and free, so it is always tried first — no backend should be billed for
-// answering "what language is this".
+// --- Language detection ----------------------------------------------------
+//
+// Three stages, most certain first:
+//   1. detectByScript  — Unicode character census. Local, deterministic, and the
+//      only stage that survives an email being half boilerplate.
+//   2. i18n.detectLanguage (CLD2) — the Latin-script languages, which a census
+//      cannot tell apart.
+//   3. the configured LLM backend — last resort, Ollama / OpenAI-compatible only.
+
+const DETECT_SAMPLE_LIMIT = 4000;   // chars handed to the classifier
+
+// "zh-CN" / "zh-Hant" -> "zh". Everything downstream compares against the plain
+// two-letter codes in LANGUAGE_NAMES; an unknown language is null, not a guess.
+function normalizeLangCode(code) {
+  if (!code) return null;
+  const base = String(code).split("-")[0].toLowerCase();
+  return LANGUAGE_NAMES[base] ? base : null;
+}
+
+// Everything that carries no language signal is removed before counting: a
+// Chinese body wrapped in an English footer of tracking links otherwise reads as
+// English, to CLD2 and to a census alike.
+function cleanSample(text) {
+  return String(text || "")
+    .replace(/^\s*[>|].*$/gm, " ")                  // quoted reply lines
+    .replace(/https?:\/\/\S+|www\.\S+/gi, " ")      // URLs
+    .replace(/[^\s@]+@[^\s@]+\.[^\s@]+/g, " ")      // addresses
+    .replace(/&[a-z]+;|&#\d+;/gi, " ")              // entity leftovers
+    .replace(/[\d_=+*\/\\[\]{}()<>|~^`]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// One CJK character carries about as much text as this many Latin letters. The
+// weight is the whole point: an 80-character Chinese body is a complete message,
+// 80 Latin letters is one line, and comparing them raw is what let a six-line
+// English disclaimer outvote the Chinese mail it was stapled to.
+const CJK_WEIGHT = 2.5;
+
+// Two gates per script. Dominant: a clean message written in it, which needs a
+// high share because a three-line English reply signed off with a Chinese company
+// name sits near 0.6 and must not count. Diluted: a real message buried under an
+// English footer, disclaimer or unsubscribe block, which is allowed a low share
+// only once there is enough of the script to be a body rather than a signature.
+function scriptWins(count, latin, weight) {
+  if (count === 0) return false;
+  const share = (count * weight) / (count * weight + latin);
+  return (count >= 8 && share >= 0.75) || (count >= 30 && share >= 0.15);
+}
+
+// Character-class census over the cleaned sample. Judging by share of letters is
+// what makes it robust: a mail stays Chinese however much English signature,
+// disclaimer and unsubscribe text is stapled below it, which is exactly the case
+// CLD2 gets wrong by weighing the string as a whole.
+// Returns null for Latin-script text — that is CLD2's job, not this one's.
+function detectByScript(text) {
+  let han = 0, kana = 0, hangul = 0, cyrillic = 0, arabic = 0, latin = 0;
+
+  for (const ch of text) {
+    const c = ch.codePointAt(0);
+    if ((c >= 0x4e00 && c <= 0x9fff) || (c >= 0x3400 && c <= 0x4dbf) ||
+        (c >= 0xf900 && c <= 0xfaff) || (c >= 0x20000 && c <= 0x2a6df)) han++;
+    else if ((c >= 0x3040 && c <= 0x309f) || (c >= 0x30a1 && c <= 0x30fa) ||
+             (c >= 0xff66 && c <= 0xff9d) || c === 0x30fc) kana++;
+    else if ((c >= 0xac00 && c <= 0xd7a3) || (c >= 0x1100 && c <= 0x11ff) ||
+             (c >= 0x3130 && c <= 0x318f)) hangul++;
+    else if (c >= 0x0400 && c <= 0x04ff) cyrillic++;
+    else if ((c >= 0x0600 && c <= 0x06ff) || (c >= 0x0750 && c <= 0x077f)) arabic++;
+    else if ((c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) ||
+             (c >= 0xc0 && c <= 0x024f)) latin++;
+  }
+
+  if (scriptWins(hangul, latin, CJK_WEIGHT)) return "ko";
+  if (scriptWins(han + kana, latin, CJK_WEIGHT)) {
+    // Kana is the one script nothing else borrows in bulk: a Chinese mail may
+    // quote a katakana product name, never at a fifth of its CJK characters.
+    return kana / (han + kana) >= 0.2 ? "ja" : "zh";
+  }
+  if (scriptWins(cyrillic, latin, 1)) return "ru";
+  if (scriptWins(arabic, latin, 1)) return "ar";
+  return null;
+}
+
+// Gecko ships CLD2 and exposes it as i18n.detectLanguage: local, instant, free.
 // Returns null when CLD cannot decide; callers treat that as "unknown".
 async function detectLanguageLocally(sample) {
   if (typeof messenger.i18n?.detectLanguage !== "function") return null;
@@ -804,24 +890,28 @@ async function detectLanguageLocally(sample) {
     // isReliable goes false on short or mixed text; a dominant share is still
     // good enough for an email body.
     if (!result.isReliable && (top.percentage || 0) < 80) return null;
-    const base = top.language.split("-")[0].toLowerCase();  // "zh-Hant" -> "zh"
-    return LANGUAGE_NAMES[base] ? base : null;
+    return normalizeLangCode(top.language);
   } catch (e) {
     console.warn("[Translator] i18n.detectLanguage failed:", e.message);
     return null;
   }
 }
 
-// CLD first; only if it cannot decide does a backend with a model get asked.
-// Returns null when nothing could determine the language.
+// Returns null when no stage could decide. Callers translate rather than guess.
 async function detectLanguage(sample, settings) {
-  const local = await detectLanguageLocally(sample);
+  const text = cleanSample(sample);
+  if (!text) return null;
+
+  const byScript = detectByScript(text);
+  if (byScript) return byScript;
+
+  const local = await detectLanguageLocally(text);
   if (local) return local;
 
   try {
     switch (settings.service) {
-      case "ollama": return await detectWithOllama(sample, settings);
-      case "openai": return await detectWithOpenAI(sample, settings);
+      case "ollama": return await detectWithOllama(text, settings);
+      case "openai": return await detectWithOpenAI(text, settings);
       default: return null;  // Google / LibreTranslate have no detect endpoint here
     }
   } catch (e) {
@@ -830,17 +920,69 @@ async function detectLanguage(sample, settings) {
   }
 }
 
-// Extract plain text from a MessagePart tree (messenger.messages.getFull response)
-function extractPlainTextFromParts(part) {
-  if (!part) return "";
-  if (part.contentType === "text/plain" && part.body) return part.body;
-  if (Array.isArray(part.parts)) {
-    for (const p of part.parts) {
-      const text = extractPlainTextFromParts(p);
-      if (text) return text;
+// --- Detection sample ------------------------------------------------------
+
+// Enough markup stripping for a character census. Thunderbird's own
+// messengerUtilities.convertToPlainText is TB 137+, and this add-on targets 128.
+function htmlToText(html) {
+  return String(html || "")
+    .replace(/<(script|style|head)\b[\s\S]*?<\/\1>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&lt;/gi, "<").replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"').replace(/&#0?39;|&apos;/gi, "'")
+    .replace(/&amp;/gi, "&")
+    .replace(/\s+/g, " ");
+}
+
+// text/plain when the message has one, the HTML part stripped of tags otherwise.
+function textFromInlineParts(parts) {
+  const pick = (type) => (parts || [])
+    .filter(p => p && p.contentType === type && p.content)
+    .map(p => p.content)
+    .join("\n");
+  const plain = pick("text/plain");
+  return plain.trim() ? plain : htmlToText(pick("text/html"));
+}
+
+// getFull's part tree flattened to the same {contentType, content} shape.
+function flattenMessageParts(part, out = []) {
+  if (!part) return out;
+  if (part.body) out.push({ contentType: part.contentType, content: part.body });
+  if (Array.isArray(part.parts)) for (const p of part.parts) flattenMessageParts(p, out);
+  return out;
+}
+
+// The readable text of the displayed message, cleaned and capped.
+// listInlineTextParts (TB 128+) is what makes HTML-only mail detectable at all:
+// walking getFull for a text/plain part returns nothing for most newsletters and
+// notifications, and an empty sample used to mean "unknown" — so every one of
+// them was translated in full.
+async function getMessageSample(tabId) {
+  if (tabId == null) return "";
+  const msg = await messenger.messageDisplay.getDisplayedMessage(tabId);
+  if (!msg) return "";
+
+  let body = "";
+  if (typeof messenger.messages.listInlineTextParts === "function") {
+    try {
+      body = textFromInlineParts(await messenger.messages.listInlineTextParts(msg.id));
+    } catch (e) {
+      console.warn("[Translator] listInlineTextParts failed:", e.message);
     }
   }
-  return "";
+  if (!body.trim()) {
+    try {
+      body = textFromInlineParts(flattenMessageParts(await messenger.messages.getFull(msg.id)));
+    } catch (e) {
+      console.warn("[Translator] getFull failed:", e.message);
+    }
+  }
+
+  // The subject is short but always present and always in the body's language;
+  // it carries a one-line message over the census minimum.
+  return cleanSample(`${msg.subject || ""}\n${body}`).slice(0, DETECT_SAMPLE_LIMIT);
 }
 
 async function getInstalledModels(ollamaUrl) {
@@ -947,14 +1089,10 @@ browser.menus.onShown.addListener(async (info, tab) => {
       // Run on-demand detection when the cache is empty (e.g. after a manual translate)
       if (!detectedLang && tabId != null) {
         try {
-          const msg = await messenger.messageDisplay.getDisplayedMessage(tabId);
-          if (msg) {
-            const full = await messenger.messages.getFull(msg.id);
-            const sample = extractPlainTextFromParts(full).trim().slice(0, 500);
-            if (sample) {
-              detectedLang = await detectLanguage(sample, settings);
-              if (detectedLang) detectedLangByTab.set(tabId, detectedLang);
-            }
+          const sample = await getMessageSample(tabId);
+          if (sample) {
+            detectedLang = await detectLanguage(sample, settings);
+            if (detectedLang) detectedLangByTab.set(tabId, detectedLang);
           }
         } catch (e) {
           console.warn("[Translator] on-demand language detection failed in onShown:", e.message);

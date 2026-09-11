@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Privacy Translator for Thunderbird",
-  "version": "1.11.1",
+  "version": "1.12.0",
   "description": "Translate emails using Ollama, any OpenAI-compatible API, Google Translate or LibreTranslate",
   "author": "jctots (fork of zoott28354)",
   "default_locale": "en",

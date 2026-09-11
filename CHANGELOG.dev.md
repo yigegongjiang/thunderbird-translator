@@ -7,6 +7,30 @@
 
 # Changelog (developer, follow [CHANGELOG.md](./CHANGELOG.md))
 
+## [1.12.0] - 2026-09-11
+
+### Fixed
+
+- 中文 / 日文 / 韩文 / 俄文 / 阿拉伯文邮件不再被整篇送去翻译: 正文语言先按字符构成判定, 英文签名档 / 免责声明 / 退订区块再长也不会把一封中文邮件认成英文
+  - `background.js` 新增 `detectByScript()` + `scriptWins(count, latin, weight)`: Unicode 区块普查, 双闸门 (`count>=8 && share>=0.75` 主导 / `count>=30 && share>=0.15` 被稀释)
+  - `CJK_WEIGHT = 2.5`: 一个汉字承载的文本量约等于 2.5 个拉丁字母; 不加权时 6 行英文免责声明 (410 字母) 会盖过 88 字的中文正文 (裸比 0.18 < 阈值)
+  - 主导闸门 0.75 而非 0.5: 三行英文短回复 + 中文公司名签名档实测 0.59, 0.5 会把它误判成 zh 而静默跳过
+  - zh / ja 由 `kana / (han + kana) >= 0.2` 区分; 实测日文 0.6–0.75, 中文夹片假名 < 0.06
+  - `detectLanguage()` 改为三级: `detectByScript` → CLD2 → 检测模型; CLD2 只再负责拉丁语族
+  - 新增 `normalizeLangCode()`: Google 返回 `zh-CN`, 原先原样写进 `detectedLangByTab`, 与目标语 `zh` 永不相等
+- 纯 HTML 邮件 (多数通知与营销邮件) 此前取不到正文样本, 一律当「语言未知」全量翻译, 现已能正确识别并跳过
+  - 旧 `extractPlainTextFromParts()` 只认 `contentType === "text/plain"`, HTML-only 邮件返回空串 → `shouldAutoTranslate` 直接 `skip:false`
+  - 换成 `getMessageSample(tabId)`: `messages.listInlineTextParts()` (TB 128+, 正好等于 `strict_min_version`) 优先, 失败回落 `getFull()` 展平; 无 text/plain 时取 text/html 走 `htmlToText()` 剥标签
+  - 自剥标签而非 `messengerUtilities.convertToPlainText()` — 后者 TB 137+ 才有
+  - preflight / checkExemption / `menus.onShown` 三处重复取样合并到 `getMessageSample()` 一处
+
+### Changed
+
+- 语言判定取样扩大到 4000 字符并纳入邮件主题, 判定前剔除引用行 / URL / 邮箱 / 数字
+  - `cleanSample()`: 去 `^>`/`^|` 引用行、URL、邮箱、HTML 实体残渣、数字与符号串; 500 → `DETECT_SAMPLE_LIMIT = 4000`
+  - 主题并入样本, 使单行短邮件也能越过字符数下限
+  - `shouldAutoTranslate()` 对「取不到样本」与「判不出语言」各加一行 console 日志; 两者都走全量翻译, 无日志时无法区分
+
 ## [1.11.1] - 2026-09-11
 
 ### Removed

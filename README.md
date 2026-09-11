@@ -35,7 +35,8 @@ Thunderbird MailExtension (MV2), 翻译邮件正文 / 撰写窗口选区; 后端
 | 形态 | manifest v2 MailExtension; 无构建 / 无依赖 / vanilla JS |
 | 翻译路由 | `background.js` `translateText()` 单 switch → 4 个 fetch 站点 (Ollama / OpenAI 兼容 / Google / LibreTranslate), 无其他外发请求 |
 | 正文协议 | 整块送模型 + `[[n]]` 内联占位 + `#n#` 块 id; 标记回不来 → 该块退回逐节点纯文本协议重试一次。仅 Ollama + OpenAI 兼容启用, Google / LibreTranslate 走纯文本 |
-| 语言检测 | `i18n.detectLanguage()` (Gecko 内置 CLD2) 优先, 检测模型仅兜底 |
+| 语言检测 | 三级: Unicode 字符普查 (zh / ja / ko / ru / ar, 本地确定性) → `i18n.detectLanguage()` (CLD2, 拉丁语族) → 检测模型兜底 |
+| 检测取样 | `messages.listInlineTextParts()` (TB 128+), 无 text/plain 时取 text/html 剥标签; 主题并入样本; 剔除引用行 / URL / 邮箱 / 数字后截 4000 字符 |
 | 主机权限 | `*://*/*` 为 optional_permissions, 首次 Save / Test Connection 时按单主机请求 |
 | 打包 | `make_xpi.sh` 白名单 zip; 版本号唯一来源 = `manifest.json#version` |
 
