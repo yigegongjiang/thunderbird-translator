@@ -118,20 +118,6 @@ const COMPOSE_LANG_KEY = {
   libretranslate: "libreComposeLang",
 };
 
-const SERVICE_LABELS = {
-  ollama: "Ollama",
-  openai: "OpenAI-compatible API",
-  google: "Google Translate",
-  libretranslate: "LibreTranslate",
-};
-
-// Shown next to the label in the subject bar; Google has no configurable host.
-const SERVICE_URL_KEY = {
-  ollama: "ollamaUrl",
-  openai: "openaiUrl",
-  libretranslate: "libreUrl",
-};
-
 // --- Settings ---
 
 async function updateReadButtonTitle() {
@@ -394,27 +380,6 @@ messenger.runtime.onConnect.addListener((port) => {
           const shouldRevert = !!detectedLang
             && (detectedLang === targetLang || neverTranslateLangs.includes(detectedLang));
           port.postMessage({ id: message.id, success: true, shouldRevert });
-        } catch (e) {
-          port.postMessage({ id: message.id, success: false, error: e.message });
-        }
-        return;
-      }
-
-      // Subject translation request
-      if (message.command === "getTranslatedSubject") {
-        try {
-          const msg = await messenger.messageDisplay.getDisplayedMessage(tabId);
-          const subject = msg?.subject || "";
-          if (!subject) {
-            port.postMessage({ id: message.id, success: true, translated: null });
-            return;
-          }
-          const settings = await getSettings();
-          const sourceLang = tabId != null ? (detectedLangByTab.get(tabId) || null) : null;
-          const { translated } = await translateText(subject, settings, null, sourceLang);
-          const serviceLabel = SERVICE_LABELS[settings.service] || settings.service;
-          const serviceUrl = settings[SERVICE_URL_KEY[settings.service]] || null;
-          port.postMessage({ id: message.id, success: true, translated, serviceLabel, serviceUrl });
         } catch (e) {
           port.postMessage({ id: message.id, success: false, error: e.message });
         }

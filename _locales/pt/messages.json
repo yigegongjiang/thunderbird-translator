@@ -134,9 +134,5 @@
   "translationComplete": {
     "message": "Tradução concluída!",
     "description": "Mensagem exibida quando a tradução é concluída"
-  },
-  "subjectLabel": {
-    "message": "Assunto:",
-    "description": "Rótulo exibido antes do assunto traduzido do e-mail"
   }
 }

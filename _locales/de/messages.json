@@ -134,9 +134,5 @@
   "translationComplete": {
     "message": "Übersetzung abgeschlossen!",
     "description": "Meldung wenn die Übersetzung abgeschlossen ist"
-  },
-  "subjectLabel": {
-    "message": "Betreff:",
-    "description": "Bezeichnung vor dem übersetzten E-Mail-Betreff"
   }
 }

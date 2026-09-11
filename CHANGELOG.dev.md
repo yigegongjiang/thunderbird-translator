@@ -7,6 +7,21 @@
 
 # Changelog (developer, follow [CHANGELOG.md](./CHANGELOG.md))
 
+## [1.11.1] - 2026-09-11
+
+### Removed
+
+- 不再翻译邮件主题: 每封邮件少发一次翻译请求, 正文顶部的「已翻译 / 主题」横幅一并移除
+  - `background.js`: 删 `getTranslatedSubject` 端口分支 + 仅它使用的 `SERVICE_LABELS` / `SERVICE_URL_KEY`
+  - `content/translator.js`: 删 `sendSubjectTranslateRequest` / `subjectPendingRequests` / `injectSubjectBar` 等主题栏三函数与 `translatedSubject` / `subjectBar` 状态; `reloadPage()` 不再需要清横幅
+  - 横幅是 `position: fixed` + 对 `document.body` 强加 `padding-top: !important`, 随之移除; 正文翻译不含主题 (抽取只走消息正文 document, 主题在 Thunderbird chrome 层)
+  - `_locales/*/messages.json`: 删 7 份中的死键 `subjectLabel` (横幅硬编码 `"📧 "`, 从未读取)
+
+### Fixed
+
+- 主题翻译失败不再把已经成功的正文翻译判定为失败 (按钮红色「!」)
+  - `startTranslation()` 原先 `await subjectPromise` 在同一 try 内, 主题请求抛错即整体 `{success:false}`
+
 ## [1.11.0] - 2026-09-11
 
 ### Changed

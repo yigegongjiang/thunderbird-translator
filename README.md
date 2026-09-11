@@ -8,7 +8,7 @@
 
 # Privacy Translator for Thunderbird
 
-Thunderbird MailExtension (MV2), 翻译邮件正文 / 主题 / 撰写窗口选区; 后端可选 Ollama (本地) / OpenAI 兼容 API / LibreTranslate / Google Translate。fork of [zoott28354/thunderbird-translator](https://github.com/zoott28354/thunderbird-translator)。
+Thunderbird MailExtension (MV2), 翻译邮件正文 / 撰写窗口选区; 后端可选 Ollama (本地) / OpenAI 兼容 API / LibreTranslate / Google Translate。fork of [zoott28354/thunderbird-translator](https://github.com/zoott28354/thunderbird-translator)。
 
 ## 使用
 
@@ -45,7 +45,7 @@ Thunderbird MailExtension (MV2), 翻译邮件正文 / 主题 / 撰写窗口选�
 | 路径 | 职责 |
 |---|---|
 | `background.js` | 服务路由 + 4 个后端 fetch + menus / badge / 端口生命周期 |
-| `content/translator.js` | 阅读窗口正文抽取与回写, 译后主题栏 |
+| `content/translator.js` | 阅读窗口正文抽取与回写 |
 | `content/composer.js` | 撰写窗口选区就地替换 |
 | `options/` | 设置页 (服务 / 模型 / 语言 / 自定义 prompt) |
 | `_locales/` | 7 种界面语言 `messages.json` |

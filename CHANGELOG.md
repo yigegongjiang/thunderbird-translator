@@ -11,6 +11,16 @@
 
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) + [SemVer](https://semver.org/).
 
+## [1.11.1] - 2026-09-11
+
+### Removed
+
+- 不再翻译邮件主题: 每封邮件少发一次翻译请求, 正文顶部的「已翻译 / 主题」横幅一并移除
+
+### Fixed
+
+- 主题翻译失败不再把已经成功的正文翻译判定为失败 (按钮红色「!」)
+
 ## [1.11.0] - 2026-09-11
 
 ### Changed

@@ -144,9 +144,5 @@
   "translationComplete": {
     "message": "Translation complete!",
     "description": "Message shown when translation is done"
-  },
-  "subjectLabel": {
-    "message": "Subject:",
-    "description": "Label shown before the translated email subject"
   }
 }

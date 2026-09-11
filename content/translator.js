@@ -24,14 +24,11 @@
   let isTranslating = false;
   let translationCached = false;
   let cachedLang = null;
-  let translatedSubject = null;
-  let subjectBar = null;
 
   // --- Port to background ---
 
   const port = browser.runtime.connect({ name: "translator" });
-  const pendingRequests        = new Map(); // text translate requests
-  const subjectPendingRequests = new Map(); // subject translate requests
+  const pendingRequests = new Map(); // text translate requests
   const exemptionPendingRequests = new Map(); // exemption check requests
   const capabilityPendingRequests = new Map(); // backend capability probes
   let nextRequestId = 0;
@@ -50,14 +47,6 @@
       const { resolve, reject } = exemptionPendingRequests.get(message.id);
       exemptionPendingRequests.delete(message.id);
       if (message.success) resolve({ shouldRevert: message.shouldRevert, skip: message.skip, detectedLang: message.detectedLang });
-      else reject(new Error(message.error));
-      return;
-    }
-    // Subject translate response
-    if (message.id != null && subjectPendingRequests.has(message.id)) {
-      const { resolve, reject } = subjectPendingRequests.get(message.id);
-      subjectPendingRequests.delete(message.id);
-      if (message.success) resolve({ translated: message.translated, serviceLabel: message.serviceLabel, serviceUrl: message.serviceUrl });
       else reject(new Error(message.error));
       return;
     }
@@ -105,14 +94,6 @@
     });
   }
 
-  function sendSubjectTranslateRequest() {
-    return new Promise((resolve, reject) => {
-      const id = nextRequestId++;
-      subjectPendingRequests.set(id, { resolve, reject });
-      port.postMessage({ command: "getTranslatedSubject", id });
-    });
-  }
-
   function sendPreflightRequest() {
     return new Promise((resolve, reject) => {
       const id = nextRequestId++;
@@ -127,76 +108,6 @@
       exemptionPendingRequests.set(id, { resolve, reject });
       port.postMessage({ command: "checkExemption", id });
     });
-  }
-
-  // --- Subject bar ---
-
-  function createSubjectBarStyle() {
-    if (document.getElementById("__translator_subject_bar_style__")) return;
-    const style = document.createElement("style");
-    style.id = "__translator_subject_bar_style__";
-    style.textContent = `
-      #__translator_subject_bar__ {
-        position: fixed;
-        top: 0;
-        left: 0;
-        right: 0;
-        z-index: 9999;
-        padding: 5px 12px 6px;
-        background: Canvas;
-        color: CanvasText;
-        border-bottom: 1px solid GrayText;
-        box-sizing: border-box;
-        color-scheme: light dark;
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      }
-      #__translator_service_info__ {
-        font-size: 11px;
-        font-weight: normal;
-        color: GrayText;
-        margin-bottom: 2px;
-      }
-      #__translator_subject_text__ {
-        font-size: 16px;
-        font-weight: 600;
-      }
-    `;
-    document.head.appendChild(style);
-  }
-
-  function injectSubjectBar({ translated, serviceLabel, serviceUrl }) {
-    removeSubjectBar();
-    createSubjectBarStyle();
-    const bar = document.createElement("div");
-    bar.id = "__translator_subject_bar__";
-
-    const infoLine = document.createElement("div");
-    infoLine.id = "__translator_service_info__";
-    infoLine.textContent = serviceUrl
-      ? `🌐 Translated via ${serviceLabel} (${serviceUrl})`
-      : `🌐 Translated via ${serviceLabel}`;
-
-    const subjectLine = document.createElement("div");
-    subjectLine.id = "__translator_subject_text__";
-    subjectLine.textContent = "📧 " + translated;
-
-    bar.appendChild(infoLine);
-    bar.appendChild(subjectLine);
-    document.body.insertBefore(bar, document.body.firstChild);
-    subjectBar = bar;
-    requestAnimationFrame(() => {
-      const height = bar.getBoundingClientRect().height || 52;
-      document.body.style.setProperty("padding-top", height + "px", "important");
-      document.body.style.setProperty("margin-top", "0", "important");
-    });
-  }
-
-  function removeSubjectBar() {
-    const existing = document.getElementById("__translator_subject_bar__");
-    if (existing) existing.remove();
-    document.body.style.removeProperty("padding-top");
-    document.body.style.removeProperty("margin-top");
-    subjectBar = null;
   }
 
   // --- DOM Text Extraction ---
@@ -443,7 +354,6 @@
       // Invalidate cache if language changed
       if (targetLang && targetLang !== cachedLang) {
         translationCached = false;
-        translatedSubject = null;
         for (const [node, data] of nodeMap.entries()) {
           nodeMap.set(node, { original: data.original, translated: null });
         }
@@ -456,7 +366,6 @@
             node.textContent = data.translated;
           }
         }
-        if (translatedSubject) injectSubjectBar(translatedSubject);
         isTranslated = true;
         return { success: true };
       }
@@ -475,21 +384,12 @@
         console.warn("[Translator] Capability probe failed, using plain protocol:", e.message);
       }
 
-      // Translate body and subject in parallel
-      const bodyPromise = (async () => {
-        for (const block of preBlocks) await translateNodeByNode(block);
-        if (flowBlocks.length > 0) await translateBlocks(flowBlocks, structured);
-      })();
-      const subjectPromise = sendSubjectTranslateRequest();
-
-      await bodyPromise;
-      translatedSubject = await subjectPromise;
+      for (const block of preBlocks) await translateNodeByNode(block);
+      if (flowBlocks.length > 0) await translateBlocks(flowBlocks, structured);
 
       isTranslated = true;
       translationCached = true;
       if (targetLang) cachedLang = targetLang;
-
-      if (translatedSubject?.translated) injectSubjectBar(translatedSubject);
 
       return { success: true };
     } catch (e) {
@@ -504,7 +404,6 @@
 
 
   function reloadPage() {
-    removeSubjectBar();
     for (const [node, data] of nodeMap.entries()) {
       try {
         if (document.body.contains(node)) node.textContent = data.original;
