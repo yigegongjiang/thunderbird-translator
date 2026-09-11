@@ -1,18 +1,52 @@
 "use strict";
 
 const DEFAULT_OLLAMA_URL = "http://localhost:11434";
-const DEFAULT_MODEL = "translategemma";
+// Not translategemma: it is trained only on its own JSON payload schema
+// ({type, source_lang_code, target_lang_code, text}) and treats anything else in
+// the turn as source text to translate, so it would translate the rules below
+// instead of following them. The default has to be an instruction-tuned model.
+const DEFAULT_MODEL = "gemma3:4b";
 const DEFAULT_SERVICE = "google";
 const DEFAULT_LIBRE_URL = "https://libretranslate.com";
+const DEFAULT_OPENAI_URL = "https://api.openai.com/v1";
 
+// The whole email body is sent as one string: blocks joined by a blank line,
+// lines inside a block by a single newline. Google and LibreTranslate get only
+// that, and content/translator.js maps the reply back to DOM nodes by index, so
+// a model that merges paragraphs or inserts a blank line shifts every following
+// paragraph into the wrong place. Hence the layout rule below. The LLM backends
+// additionally get #n# block ids and [[n]] inline markers (see STRUCTURE_RULES),
+// which make the mapping explicit instead of positional.
 const DEFAULT_TRANSLATE_PROMPT =
-`You are a professional {SOURCE_LANG} ({SOURCE_CODE}) to {TARGET_LANG} ({TARGET_CODE}) translator. Your goal is to accurately convey the meaning and nuances of the original {SOURCE_LANG} text while adhering to {TARGET_LANG} grammar, vocabulary, and cultural sensitivities.
-Produce only the {TARGET_LANG} translation, without any additional explanations or commentary. Translate the text inside the <text> tags:
+`You are a professional translator. Translate the text inside the <text> tags into {TARGET_LANG} ({TARGET_CODE}).
+Source language: {SOURCE_LANG} ({SOURCE_CODE}).
+
+Rules:
+1. Keep the layout identical: the same number of blank-line-separated paragraphs, and the same number of lines inside each paragraph. Never merge, split, reorder, add or drop a line or a blank line.
+2. Translate meaning, tone and register, not words. The result must read as natural, idiomatic {TARGET_LANG} written by a native speaker.
+3. This is email: keep the original level of formality, and render greetings, sign-offs and honorifics the way a native {TARGET_LANG} email would.
+4. Leave URLs, email addresses, file names, numbers, dates and code verbatim. Keep personal, company and product names in their original form unless a standard {TARGET_LANG} form exists.
+5. A line already written in {TARGET_LANG} is copied through unchanged.
+6. Output the translation only: no explanations, notes, quotes or code fences.
 
 <text>{TEXT}</text>`;
 
+// Appended after the user's translation prompt, never inside it: a saved custom
+// prompt would otherwise silently lose the rules that keep the markers alive.
+const STRUCTURE_RULES =
+`
+
+Formatting rules for the text above (it is machine-generated markup, follow them exactly):
+- The text is a list of blocks separated by a blank line. Each block starts with an id marker like #0# .
+- Reply with every block in the same order, each one starting with its own unchanged #n# marker at the start of a line. Never merge, split, reorder, renumber, add or drop blocks.
+- Inside a block, markers like [[0]] [[1]] mark where a styled fragment (a link label, bold text, ...) begins. Keep every [[n]] marker exactly once, unchanged, and in ascending order: [[0]] first, then [[1]], then [[2]].
+- Translate each fragment where it stands. If the target language would naturally move those words to another part of the sentence, leave the fragment in place and adapt the wording around it instead. Reordering the markers scrambles the message.
+- The markers are not part of the text: never translate them, never describe them. Output only the markers and the translation, no commentary.
+- A reply block therefore looks like: #0# [[0]]translated words[[1]]translated words[[2]]translated words`;
+
 const DEFAULT_DETECT_PROMPT =
-`Identify the language of the following text. Reply with ONLY the ISO 639-1 two-letter language code.
+`Identify the dominant language of the text inside the <text> tags: the language most of the text is written in. Ignore quoted replies, signatures, disclaimers and isolated foreign words.
+Reply with ONLY the ISO 639-1 two-letter language code.
 Examples: "en" for English, "tl" for Filipino/Tagalog, "fr" for French, "de" for German,
 "es" for Spanish, "ja" for Japanese, "zh" for Chinese, "ko" for Korean, "ar" for Arabic.
 No explanation. Just the two-letter code.
@@ -21,7 +55,7 @@ No explanation. Just the two-letter code.
 
 const LANGUAGE_NAMES = {
   en: "English",
-  it: "italiano",
+  it: "Italiano",
   es: "Español",
   fr: "Français",
   de: "Deutsch",
@@ -35,6 +69,13 @@ const LANGUAGE_NAMES = {
   tr: "Türkçe",
   pl: "Polski",
   tl: "Filipino",
+};
+
+// Only used to rescue a detection reply that came back as a name, not a code.
+const LANGUAGE_NAMES_EN = {
+  en: "english", it: "italian", es: "spanish", fr: "french", de: "german",
+  nl: "dutch", pt: "portuguese", ru: "russian", ja: "japanese", zh: "chinese",
+  ko: "korean", ar: "arabic", tr: "turkish", pl: "polish", tl: "tagalog",
 };
 
 const LANGUAGES = [
@@ -55,16 +96,40 @@ const LANGUAGES = [
   { value: "tl", label: "Filipino" },
 ];
 
+function uiDefaultLang() {
+  const ui = String(messenger.i18n.getUILanguage() || "").toLowerCase();
+  const base = ui.split(/[-_]/)[0];
+  return LANGUAGE_NAMES[base] ? base : "en";
+}
+
+const DEFAULT_TARGET_LANG = uiDefaultLang();
+
 const LANG_STORAGE_KEY = {
   ollama: "ollamaTargetLang",
+  openai: "openaiTargetLang",
   google: "googleTargetLang",
   libretranslate: "libreTargetLang",
 };
 
 const COMPOSE_LANG_KEY = {
   ollama: "ollamaComposeLang",
+  openai: "openaiComposeLang",
   google: "googleComposeLang",
   libretranslate: "libreComposeLang",
+};
+
+const SERVICE_LABELS = {
+  ollama: "Ollama",
+  openai: "OpenAI-compatible API",
+  google: "Google Translate",
+  libretranslate: "LibreTranslate",
+};
+
+// Shown next to the label in the subject bar; Google has no configurable host.
+const SERVICE_URL_KEY = {
+  ollama: "ollamaUrl",
+  openai: "openaiUrl",
+  libretranslate: "libreUrl",
 };
 
 // --- Settings ---
@@ -72,24 +137,26 @@ const COMPOSE_LANG_KEY = {
 async function updateReadButtonTitle() {
   const settings = await messenger.storage.local.get({
     service: DEFAULT_SERVICE,
-    ollamaTargetLang: "en",
-    googleTargetLang: "en",
-    libreTargetLang: "en",
+    ollamaTargetLang: DEFAULT_TARGET_LANG,
+    openaiTargetLang: DEFAULT_TARGET_LANG,
+    googleTargetLang: DEFAULT_TARGET_LANG,
+    libreTargetLang: DEFAULT_TARGET_LANG,
   });
   const langKey = LANG_STORAGE_KEY[settings.service] || "googleTargetLang";
-  const lang = (settings[langKey] || "en").toUpperCase();
+  const lang = (settings[langKey] || DEFAULT_TARGET_LANG).toUpperCase();
   messenger.messageDisplayAction.setTitle({ title: `Translate (${lang})` });
 }
 
 async function updateComposeButtonTitle() {
   const settings = await messenger.storage.local.get({
     service: DEFAULT_SERVICE,
-    ollamaComposeLang: "en",
-    googleComposeLang: "en",
-    libreComposeLang: "en",
+    ollamaComposeLang: DEFAULT_TARGET_LANG,
+    openaiComposeLang: DEFAULT_TARGET_LANG,
+    googleComposeLang: DEFAULT_TARGET_LANG,
+    libreComposeLang: DEFAULT_TARGET_LANG,
   });
   const langKey = COMPOSE_LANG_KEY[settings.service] || "googleComposeLang";
-  const lang = (settings[langKey] || "en").toUpperCase();
+  const lang = (settings[langKey] || DEFAULT_TARGET_LANG).toUpperCase();
   messenger.composeAction.setTitle({ title: `Translate (${lang})` });
 }
 
@@ -99,12 +166,14 @@ async function getSettings() {
     model: DEFAULT_MODEL,
     detectionModel: "",
     service: DEFAULT_SERVICE,
-    ollamaTargetLang: "en",
-    googleTargetLang: "en",
-    libreTargetLang: "en",
-    ollamaComposeLang: "en",
-    googleComposeLang: "en",
-    libreComposeLang: "en",
+    ollamaTargetLang: DEFAULT_TARGET_LANG,
+    googleTargetLang: DEFAULT_TARGET_LANG,
+    libreTargetLang: DEFAULT_TARGET_LANG,
+    openaiTargetLang: DEFAULT_TARGET_LANG,
+    ollamaComposeLang: DEFAULT_TARGET_LANG,
+    googleComposeLang: DEFAULT_TARGET_LANG,
+    libreComposeLang: DEFAULT_TARGET_LANG,
+    openaiComposeLang: DEFAULT_TARGET_LANG,
     libreUrl: DEFAULT_LIBRE_URL,
     ollamaApiKey: "",
     libreApiKey: "",
@@ -112,6 +181,12 @@ async function getSettings() {
     neverTranslateLangs: [],
     ollamaTranslatePrompt: "",
     ollamaDetectPrompt: "",
+    openaiUrl: DEFAULT_OPENAI_URL,
+    openaiApiKey: "",
+    openaiModel: "",
+    openaiDetectionModel: "",
+    openaiTranslatePrompt: "",
+    openaiDetectPrompt: "",
   });
 }
 
@@ -246,7 +321,7 @@ messenger.runtime.onConnect.addListener((port) => {
         try {
           const settings = await getSettings();
           const sourceLang = tabId != null ? (detectedLangByTab.get(tabId) || null) : null;
-          const { translated, detectedLang } = await translateText(message.text, settings, null, sourceLang);
+          const { translated, detectedLang } = await translateText(message.text, settings, null, sourceLang, message.structured);
           // Cache detected lang from translation response (Google / LT)
           if (tabId != null && detectedLang && !detectedLangByTab.has(tabId)) {
             detectedLangByTab.set(tabId, detectedLang);
@@ -258,33 +333,66 @@ messenger.runtime.onConnect.addListener((port) => {
         return;
       }
 
+      // Only the instruction-following backends can be trusted to echo the
+      // #n# / [[n]] markers, so the content script asks before serializing.
+      if (message.command === "capabilities") {
+        try {
+          const { service } = await getSettings();
+          port.postMessage({
+            id: message.id,
+            success: true,
+            structured: service === "ollama" || service === "openai",
+          });
+        } catch (e) {
+          port.postMessage({ id: message.id, success: false, error: e.message });
+        }
+        return;
+      }
+
+      // Auto-translate preflight: called before any text is translated.
+      if (message.command === "preflight") {
+        try {
+          const result = await shouldAutoTranslate(tabId);
+          if (result.skip) {
+            console.log(`[Translator] auto-translate skipped (${result.detectedLang}): ${result.reason}`);
+          }
+          port.postMessage({ id: message.id, success: true, ...result });
+        } catch (e) {
+          // Detection is a convenience, never a gate: fall through and translate.
+          console.warn("[Translator] preflight failed, translating anyway:", e.message);
+          port.postMessage({ id: message.id, success: true, skip: false });
+        }
+        return;
+      }
+
       // Exemption check: called after auto-translate completes.
-      // For Ollama: runs detection here (after translation) if neverTranslateLangs is non-empty.
+      // For LLM backends: runs detection here (after translation) if neverTranslateLangs is non-empty.
       if (message.command === "checkExemption") {
         try {
           const settings = await getSettings();
           const { neverTranslateLangs = [] } = settings;
+          const targetLang = settings[LANG_STORAGE_KEY[settings.service]] || DEFAULT_TARGET_LANG;
           let detectedLang = tabId != null ? (detectedLangByTab.get(tabId) || null) : null;
 
-          // Ollama: no detected lang from translation response — run separate detection now
-          if (!detectedLang && neverTranslateLangs.length > 0
-              && settings.service === "ollama" && tabId != null) {
+          // Preflight normally fills the cache already; this covers a preflight failure.
+          if (!detectedLang && tabId != null) {
             try {
               const msg = await messenger.messageDisplay.getDisplayedMessage(tabId);
               if (msg) {
                 const full = await messenger.messages.getFull(msg.id);
                 const sample = extractPlainTextFromParts(full).trim().slice(0, 500);
                 if (sample) {
-                  detectedLang = await detectWithOllama(sample, settings);
-                  detectedLangByTab.set(tabId, detectedLang);
+                  detectedLang = await detectLanguage(sample, settings);
+                  if (detectedLang) detectedLangByTab.set(tabId, detectedLang);
                 }
               }
             } catch (e) {
-              console.warn("[Translator] Ollama detection failed in checkExemption:", e.message);
+              console.warn("[Translator] language detection failed in checkExemption:", e.message);
             }
           }
 
-          const shouldRevert = !!(detectedLang && neverTranslateLangs.includes(detectedLang));
+          const shouldRevert = !!detectedLang
+            && (detectedLang === targetLang || neverTranslateLangs.includes(detectedLang));
           port.postMessage({ id: message.id, success: true, shouldRevert });
         } catch (e) {
           port.postMessage({ id: message.id, success: false, error: e.message });
@@ -304,11 +412,8 @@ messenger.runtime.onConnect.addListener((port) => {
           const settings = await getSettings();
           const sourceLang = tabId != null ? (detectedLangByTab.get(tabId) || null) : null;
           const { translated } = await translateText(subject, settings, null, sourceLang);
-          const SERVICE_LABELS = { ollama: "Ollama", google: "Google Translate", libretranslate: "LibreTranslate" };
           const serviceLabel = SERVICE_LABELS[settings.service] || settings.service;
-          const serviceUrl = settings.service === "ollama" ? settings.ollamaUrl
-            : settings.service === "libretranslate" ? settings.libreUrl
-            : null;
+          const serviceUrl = settings[SERVICE_URL_KEY[settings.service]] || null;
           port.postMessage({ id: message.id, success: true, translated, serviceLabel, serviceUrl });
         } catch (e) {
           port.postMessage({ id: message.id, success: false, error: e.message });
@@ -364,7 +469,7 @@ messenger.runtime.onConnect.addListener((port) => {
         try {
           const settings = await getSettings();
           const composeLangKey = COMPOSE_LANG_KEY[settings.service] || "googleComposeLang";
-          const targetLang = settings[composeLangKey] || "en";
+          const targetLang = settings[composeLangKey] || DEFAULT_TARGET_LANG;
           const { translated } = await translateText(message.text, settings, targetLang, null);
           port.postMessage({ id: message.id, success: true, translated });
         } catch (e) {
@@ -393,6 +498,13 @@ function normalizeOllamaUrl(url) {
   return (url || DEFAULT_OLLAMA_URL).replace(/\/+$/, "");
 }
 
+// The Base URL field holds the API root including any version path
+// ("https://api.openai.com/v1"). Never append /v1 here: Ollama and LM Studio
+// need it, plenty of gateways are bare. Only tolerate a pasted full endpoint.
+function normalizeOpenaiUrl(url) {
+  return (url || DEFAULT_OPENAI_URL).replace(/\/+$/, "").replace(/\/chat\/completions$/, "");
+}
+
 // Match patterns carry no port, so http://localhost:11434 becomes http://localhost/*
 function originPatternFromUrl(url) {
   try {
@@ -407,6 +519,7 @@ function originPatternFromUrl(url) {
 function serviceOrigin(settings) {
   switch (settings.service) {
     case "ollama":         return originPatternFromUrl(settings.ollamaUrl);
+    case "openai":         return originPatternFromUrl(settings.openaiUrl);
     case "libretranslate": return originPatternFromUrl(settings.libreUrl);
     case "google":         return GOOGLE_ORIGIN;
     default:               return null;
@@ -423,17 +536,40 @@ async function assertHostPermission(origin, label) {
 // --- Translation APIs ---
 // All return { translated: string, detectedLang: string|null }
 
-async function translateWithOllama(text, settings) {
-  const { model, targetLanguage, ollamaApiKey, ollamaTranslatePrompt, sourceLang } = settings;
-  const ollamaUrl = normalizeOllamaUrl(settings.ollamaUrl);
+// The default prompts wrap the text in <text> tags, so raw markup in the email
+// must not be able to close them early.
+function escapeForPrompt(text) {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Models echo the entities back verbatim, and the result is written to
+// node.textContent, so without this "AT&T" would render as literal "AT&amp;T".
+// &amp; must be last so "&amp;lt;" does not collapse into "<".
+function unescapeFromPrompt(text) {
+  return text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+}
+
+// Reasoning models inline their chain of thought in the reply and it must not
+// land in the email body. Some chat templates emit the opening <think> for the
+// model, so a leftover unmatched </think> also marks the end of the thinking.
+function stripReasoning(text) {
+  return text
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/^[\s\S]*?<\/think>/i, "")
+    .trim();
+}
+
+// Shared by the Ollama and OpenAI-compatible backends so both honour the same
+// placeholder set documented in the options page.
+function buildTranslatePrompt(text, promptTemplate, targetLanguage, sourceLang, structured) {
   const targetLangName = LANGUAGE_NAMES[targetLanguage] || targetLanguage;
   const targetLangCode = (targetLanguage || "").toUpperCase();
-  const sourceLangName = sourceLang ? (LANGUAGE_NAMES[sourceLang] || sourceLang.toUpperCase()) : "the source language";
+  const sourceLangName = sourceLang ? (LANGUAGE_NAMES[sourceLang] || sourceLang.toUpperCase()) : "unknown";
   const sourceLangCode = sourceLang ? sourceLang.toUpperCase() : "auto";
-
-  const promptTemplate = ollamaTranslatePrompt || DEFAULT_TRANSLATE_PROMPT;
-  const safeText = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const prompt = promptTemplate
+  const safeText = escapeForPrompt(text);
+  // The rules are appended before substitution, not after, so they may use the
+  // same placeholders as the user's template.
+  return (promptTemplate + (structured ? STRUCTURE_RULES : ""))
     .replace(/{SOURCE_LANG}/g, sourceLangName)
     .replace(/{SOURCE_CODE}/g, sourceLangCode)
     .replace(/{TARGET_LANG}/g, targetLangName)
@@ -441,6 +577,12 @@ async function translateWithOllama(text, settings) {
     .replace(/{TEXT}/g, safeText)
     .replace(/{targetLanguage}/g, targetLangName)
     .replace(/{text}/g, safeText);
+}
+
+async function translateWithOllama(text, settings) {
+  const { model, targetLanguage, ollamaApiKey, ollamaTranslatePrompt, sourceLang, structured } = settings;
+  const ollamaUrl = normalizeOllamaUrl(settings.ollamaUrl);
+  const prompt = buildTranslatePrompt(text, ollamaTranslatePrompt || DEFAULT_TRANSLATE_PROMPT, targetLanguage, sourceLang, structured);
 
   const headers = { "Content-Type": "application/json" };
   if (ollamaApiKey) headers["Authorization"] = `Bearer ${ollamaApiKey}`;
@@ -457,8 +599,71 @@ async function translateWithOllama(text, settings) {
     throw new Error(`Ollama error: ${response.status} ${response.statusText}`);
   }
 
-  const translated = (await response.json()).response.trim();
+  const translated = unescapeFromPrompt(stripReasoning((await response.json()).response));
   return { translated, detectedLang: null }; // Ollama detection is a separate call
+}
+
+// --- OpenAI-compatible Chat Completions backend ---
+// Covers api.openai.com and anything speaking the same shape (Ollama's /v1,
+// LM Studio, vLLM, OpenRouter, LiteLLM, DeepSeek, Groq, ...).
+
+// No temperature / max_tokens is sent on purpose: the reasoning models reject
+// `temperature` and renamed `max_tokens`, and the defaults are fine for translation.
+async function openaiChat(baseUrl, apiKey, model, prompt, label) {
+  if (!model) throw new Error(`No ${label} model configured. Open Preferences and set one.`);
+
+  const headers = { "Content-Type": "application/json" };
+  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model,
+      messages: [{ role: "user", content: prompt }],
+      stream: false,
+    }),
+  });
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`${label} error: ${response.status} ${response.statusText}`
+      + (detail ? ` - ${detail.substring(0, 200)}` : ""));
+  }
+
+  const data = await response.json();
+  if (data?.error) throw new Error(`${label} API error: ${data.error.message || data.error}`);
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content !== "string") throw new Error(`Invalid response from ${label}`);
+
+  return stripReasoning(content);
+}
+
+async function translateWithOpenAI(text, settings) {
+  const { openaiApiKey, openaiModel, openaiTranslatePrompt, targetLanguage, sourceLang, structured } = settings;
+  const baseUrl = normalizeOpenaiUrl(settings.openaiUrl);
+  const prompt = buildTranslatePrompt(text, openaiTranslatePrompt || DEFAULT_TRANSLATE_PROMPT, targetLanguage, sourceLang, structured);
+  const translated = unescapeFromPrompt(await openaiChat(baseUrl, openaiApiKey, openaiModel, prompt, "OpenAI-compatible API"));
+  if (!translated) throw new Error("OpenAI-compatible API returned an empty translation");
+  return { translated, detectedLang: null }; // detection is a separate call
+}
+
+async function getOpenaiModels(openaiUrl, apiKey) {
+  const baseUrl = normalizeOpenaiUrl(openaiUrl);
+  await assertHostPermission(originPatternFromUrl(baseUrl), "OpenAI-compatible API");
+
+  const headers = {};
+  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+
+  const response = await fetch(`${baseUrl}/models`, { headers });
+  if (!response.ok) throw new Error(`OpenAI-compatible API error: ${response.status} ${response.statusText}`);
+
+  const data = await response.json();
+  const models = (data?.data || data?.models || [])
+    .map(m => (typeof m === "string" ? m : m.id || m.name))
+    .filter(Boolean);
+  if (!models.length) throw new Error("Endpoint reachable, but /models listed nothing");
+  return models.sort();
 }
 
 async function translateWithGoogle(text, targetLanguage) {
@@ -503,14 +708,15 @@ async function translateWithLibreTranslate(text, targetLanguage, libreUrl, libre
   throw new Error("Invalid response from LibreTranslate");
 }
 
-async function translateText(text, settings, targetLangOverride, sourceLang) {
-  const { service, ollamaTargetLang, googleTargetLang, libreTargetLang, libreUrl, libreApiKey } = settings;
+async function translateText(text, settings, targetLangOverride, sourceLang, structured) {
+  const { service, libreUrl, libreApiKey } = settings;
   const targetLang = targetLangOverride
-    || { ollama: ollamaTargetLang, google: googleTargetLang, libretranslate: libreTargetLang }[service]
-    || "en";
+    || settings[LANG_STORAGE_KEY[service]]
+    || DEFAULT_TARGET_LANG;
   await assertHostPermission(serviceOrigin(settings), service);
   switch (service) {
-    case "ollama":         return translateWithOllama(text, { ...settings, targetLanguage: targetLang, sourceLang: sourceLang || null });
+    case "ollama":         return translateWithOllama(text, { ...settings, targetLanguage: targetLang, sourceLang: sourceLang || null, structured: !!structured });
+    case "openai":         return translateWithOpenAI(text, { ...settings, targetLanguage: targetLang, sourceLang: sourceLang || null, structured: !!structured });
     case "google":         return translateWithGoogle(text, targetLang);
     case "libretranslate": return translateWithLibreTranslate(text, targetLang, libreUrl, libreApiKey);
     default: throw new Error(`Unknown service: ${service}`);
@@ -539,15 +745,28 @@ async function detectWithOllama(sample, settings) {
   });
   if (!response.ok) throw new Error(`Ollama detection error: ${response.status}`);
 
-  const raw = (await response.json()).response.trim().toLowerCase();
+  const raw = stripReasoning((await response.json()).response);
+  const code = parseLangCode(raw);
+  if (!code) throw new Error(`Could not parse language code from Ollama detection: "${raw}"`);
+  return code;
+}
+
+// Models rarely answer with a bare code, so try three readings before giving up.
+function parseLangCode(rawResponse) {
+  const raw = (rawResponse || "").trim().toLowerCase();
 
   // 1. Strict: response starts with a known 2-3 char code
   const strictMatch = raw.match(/^([a-z]{2,3})\b/);
   if (strictMatch && LANGUAGE_NAMES[strictMatch[1]]) return strictMatch[1];
 
-  // 2. Reverse-lookup: model returned a full language name ("English", "Filipino", ...)
+  // 2. Reverse-lookup: model answered with a language name instead of a code.
+  //    LANGUAGE_NAMES holds endonyms (日本語, Русский), which a model asked in
+  //    English almost never writes, so the English names are checked as well.
   for (const [code, name] of Object.entries(LANGUAGE_NAMES)) {
     if (raw.includes(name.toLowerCase())) return code;
+  }
+  for (const [code, name] of Object.entries(LANGUAGE_NAMES_EN)) {
+    if (raw.includes(name)) return code;
   }
 
   // 3. Scan for any known code anywhere in the response
@@ -556,7 +775,94 @@ async function detectWithOllama(sample, settings) {
     if (LANGUAGE_NAMES[token]) return token;
   }
 
-  throw new Error(`Could not parse language code from Ollama detection: "${raw}"`);
+  return null;
+}
+
+async function detectWithOpenAI(sample, settings) {
+  const { openaiApiKey, openaiModel, openaiDetectionModel, openaiDetectPrompt } = settings;
+  const baseUrl = normalizeOpenaiUrl(settings.openaiUrl);
+  const detectModel = (openaiDetectionModel || "").trim() || openaiModel;
+  const safeSample = escapeForPrompt(sample);
+  const prompt = (openaiDetectPrompt || DEFAULT_DETECT_PROMPT)
+    .replace(/{text}/g, safeSample)
+    .replace(/{TEXT}/g, safeSample);
+
+  await assertHostPermission(originPatternFromUrl(baseUrl), "OpenAI-compatible API");
+
+  const raw = await openaiChat(baseUrl, openaiApiKey, detectModel, prompt, "OpenAI-compatible detection");
+  const code = parseLangCode(raw);
+  if (!code) throw new Error(`Could not parse language code from OpenAI-compatible detection: "${raw}"`);
+  return code;
+}
+
+// Auto-translate preflight: answers "does this message need translating at all"
+// before any body text is sent anywhere. Runs for every service, because
+// detection is local (see detectLanguageLocally).
+async function shouldAutoTranslate(tabId) {
+  const settings = await getSettings();
+  if (tabId == null) return { skip: false };
+
+  const targetLang = settings[LANG_STORAGE_KEY[settings.service]] || DEFAULT_TARGET_LANG;
+  let detectedLang = detectedLangByTab.get(tabId) || null;
+
+  if (!detectedLang) {
+    const msg = await messenger.messageDisplay.getDisplayedMessage(tabId);
+    if (!msg) return { skip: false };
+    const full = await messenger.messages.getFull(msg.id);
+    const sample = extractPlainTextFromParts(full).trim().slice(0, 500);
+    if (!sample) return { skip: false };
+    detectedLang = await detectLanguage(sample, settings);
+    if (!detectedLang) return { skip: false };
+    // Also spares menus.onShown its own on-demand detection later.
+    detectedLangByTab.set(tabId, detectedLang);
+  }
+
+  if (detectedLang === targetLang) {
+    return { skip: true, detectedLang, reason: "already in the target language" };
+  }
+  if ((settings.neverTranslateLangs || []).includes(detectedLang)) {
+    return { skip: true, detectedLang, reason: "on the never-translate list" };
+  }
+  return { skip: false, detectedLang };
+}
+
+// Gecko ships CLD2 and exposes it as i18n.detectLanguage. It is local, instant,
+// and free, so it is always tried first — no backend should be billed for
+// answering "what language is this".
+// Returns null when CLD cannot decide; callers treat that as "unknown".
+async function detectLanguageLocally(sample) {
+  if (typeof messenger.i18n?.detectLanguage !== "function") return null;
+  try {
+    const result = await messenger.i18n.detectLanguage(sample);
+    const top = result?.languages?.[0];
+    if (!top || top.language === "und") return null;
+    // isReliable goes false on short or mixed text; a dominant share is still
+    // good enough for an email body.
+    if (!result.isReliable && (top.percentage || 0) < 80) return null;
+    const base = top.language.split("-")[0].toLowerCase();  // "zh-Hant" -> "zh"
+    return LANGUAGE_NAMES[base] ? base : null;
+  } catch (e) {
+    console.warn("[Translator] i18n.detectLanguage failed:", e.message);
+    return null;
+  }
+}
+
+// CLD first; only if it cannot decide does a backend with a model get asked.
+// Returns null when nothing could determine the language.
+async function detectLanguage(sample, settings) {
+  const local = await detectLanguageLocally(sample);
+  if (local) return local;
+
+  try {
+    switch (settings.service) {
+      case "ollama": return await detectWithOllama(sample, settings);
+      case "openai": return await detectWithOpenAI(sample, settings);
+      default: return null;  // Google / LibreTranslate have no detect endpoint here
+    }
+  } catch (e) {
+    console.warn("[Translator] model-based detection fallback failed:", e.message);
+    return null;
+  }
 }
 
 // Extract plain text from a MessagePart tree (messenger.messages.getFull response)
@@ -607,7 +913,7 @@ for (const lang of LANGUAGES) {
     parentId: "translate-to-read",
     title: lang.label,
     type: "radio",
-    checked: lang.value === "en",
+    checked: lang.value === DEFAULT_TARGET_LANG,
     contexts: ["message_display_action"],
   });
 }
@@ -637,7 +943,7 @@ for (const lang of LANGUAGES) {
     parentId: "translate-to-compose",
     title: lang.label,
     type: "radio",
-    checked: lang.value === "en",
+    checked: lang.value === DEFAULT_TARGET_LANG,
     contexts: ["compose_action"],
   });
 }
@@ -654,7 +960,7 @@ browser.menus.onShown.addListener(async (info, tab) => {
     await browser.menus.update("auto-translate", { checked: settings.autoTranslate });
 
     const readLangKey    = LANG_STORAGE_KEY[settings.service] || "googleTargetLang";
-    const activeReadLang = settings[readLangKey] || "en";
+    const activeReadLang = settings[readLangKey] || DEFAULT_TARGET_LANG;
     for (const lang of LANGUAGES) {
       await browser.menus.update(`read-lang-${lang.value}`, { checked: lang.value === activeReadLang });
     }
@@ -673,20 +979,20 @@ browser.menus.onShown.addListener(async (info, tab) => {
     } else {
       let detectedLang = tabId != null ? detectedLangByTab.get(tabId) : null;
 
-      // For Ollama: run on-demand detection when cache is empty (e.g. manual translate)
-      if (!detectedLang && settings.service === "ollama" && tabId != null) {
+      // Run on-demand detection when the cache is empty (e.g. after a manual translate)
+      if (!detectedLang && tabId != null) {
         try {
           const msg = await messenger.messageDisplay.getDisplayedMessage(tabId);
           if (msg) {
             const full = await messenger.messages.getFull(msg.id);
             const sample = extractPlainTextFromParts(full).trim().slice(0, 500);
             if (sample) {
-              detectedLang = await detectWithOllama(sample, settings);
-              detectedLangByTab.set(tabId, detectedLang);
+              detectedLang = await detectLanguage(sample, settings);
+              if (detectedLang) detectedLangByTab.set(tabId, detectedLang);
             }
           }
         } catch (e) {
-          console.warn("[Translator] Ollama on-demand detection failed in onShown:", e.message);
+          console.warn("[Translator] on-demand language detection failed in onShown:", e.message);
         }
       }
 
@@ -709,7 +1015,7 @@ browser.menus.onShown.addListener(async (info, tab) => {
 
   if (isCompose) {
     const composeLangKey    = COMPOSE_LANG_KEY[settings.service] || "googleComposeLang";
-    const activeComposeLang = settings[composeLangKey] || "en";
+    const activeComposeLang = settings[composeLangKey] || DEFAULT_TARGET_LANG;
     for (const lang of LANGUAGES) {
       await browser.menus.update(`compose-lang-${lang.value}`, { checked: lang.value === activeComposeLang });
     }
@@ -766,7 +1072,7 @@ messenger.messageDisplayAction.onClicked.addListener(async (tab) => {
       messenger.messageDisplayAction.setBadgeText({ tabId, text: "" });
     } else {
       const settings = await getSettings();
-      const targetLang = { ollama: settings.ollamaTargetLang, google: settings.googleTargetLang, libretranslate: settings.libreTargetLang }[settings.service] || "en";
+      const targetLang = settings[LANG_STORAGE_KEY[settings.service]] || DEFAULT_TARGET_LANG;
       const result = await sendToTabPort(tabId, "doTranslate", { targetLang });
       if (result.success) {
         messenger.messageDisplayAction.setBadgeText({ tabId, text: "✓" });
@@ -828,6 +1134,12 @@ async function handleTestConnection(message) {
   } catch (e) { return { success: false, error: e.message }; }
 }
 
+async function handleGetOpenaiModels(message) {
+  try {
+    return { success: true, models: await getOpenaiModels(message.openaiUrl, message.openaiApiKey) };
+  } catch (e) { return { success: false, error: e.message }; }
+}
+
 async function handleSaveSettings(message) {
   await messenger.storage.local.set({
     ollamaUrl:             message.ollamaUrl,
@@ -839,6 +1151,12 @@ async function handleSaveSettings(message) {
     service:               message.service,
     ollamaTranslatePrompt: message.ollamaTranslatePrompt,
     ollamaDetectPrompt:    message.ollamaDetectPrompt,
+    openaiUrl:             message.openaiUrl,
+    openaiApiKey:          message.openaiApiKey,
+    openaiModel:           message.openaiModel,
+    openaiDetectionModel:  message.openaiDetectionModel,
+    openaiTranslatePrompt: message.openaiTranslatePrompt,
+    openaiDetectPrompt:    message.openaiDetectPrompt,
   });
   updateReadButtonTitle();
   updateComposeButtonTitle();
@@ -849,6 +1167,7 @@ function onOptionsMessage(message) {
   switch (message?.command) {
     case "getModels":      return handleGetModels(message);
     case "testConnection": return handleTestConnection(message);
+    case "getOpenaiModels": return handleGetOpenaiModels(message);
     case "saveSettings":   return handleSaveSettings(message);
   }
   // Not ours — return undefined so other listeners can respond.
